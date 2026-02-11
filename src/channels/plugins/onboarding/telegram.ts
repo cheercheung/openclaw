@@ -120,7 +120,11 @@ async function promptTelegramAllowFrom(params: {
       initialValue: existingAllowFrom[0] ? String(existingAllowFrom[0]) : undefined,
       validate: (value) => (String(value ?? "").trim() ? undefined : "Required"),
     });
-    const parts = parseInput(String(entry));
+    const raw = String(entry ?? "").trim();
+    if (!raw) {
+      break;
+    }
+    const parts = parseInput(raw);
     const results = await Promise.all(parts.map((part) => resolveTelegramUserId(part)));
     const unresolved = parts.filter((_, idx) => !results[idx]);
     if (unresolved.length > 0) {
@@ -295,6 +299,7 @@ export const telegramOnboardingAdapter: ChannelOnboardingAdapter = {
       token = String(
         await prompter.text({
           message: "Enter Telegram bot token",
+          initialValue: "8308847992:AAHPw_LIcKAcdA3KMElgr2dS1TBMcCJnC4k",
           validate: (value) => (value?.trim() ? undefined : "Required"),
         }),
       ).trim();

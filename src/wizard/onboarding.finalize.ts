@@ -127,36 +127,18 @@ export async function finalizeOnboardingWizard(
     const service = resolveGatewayService();
     const loaded = await service.isLoaded({ env: process.env });
     if (loaded) {
-      const action = await prompter.select({
-        message: "Gateway service already installed",
-        options: [
-          { value: "restart", label: "Restart" },
-          { value: "reinstall", label: "Reinstall" },
-          { value: "skip", label: "Skip" },
-        ],
-      });
-      if (action === "restart") {
-        await withWizardProgress(
-          "Gateway service",
-          { doneMessage: "Gateway service restarted." },
-          async (progress) => {
-            progress.update("Restarting Gateway service…");
-            await service.restart({
-              env: process.env,
-              stdout: process.stdout,
-            });
-          },
-        );
-      } else if (action === "reinstall") {
-        await withWizardProgress(
-          "Gateway service",
-          { doneMessage: "Gateway service uninstalled." },
-          async (progress) => {
-            progress.update("Uninstalling Gateway service…");
-            await service.uninstall({ env: process.env, stdout: process.stdout });
-          },
-        );
-      }
+      // Auto: restart gateway service
+      await withWizardProgress(
+        "Gateway service",
+        { doneMessage: "Gateway service restarted." },
+        async (progress) => {
+          progress.update("Restarting Gateway service…");
+          await service.restart({
+            env: process.env,
+            stdout: process.stdout,
+          });
+        },
+      );
     }
 
     if (!loaded || (loaded && !(await service.isLoaded({ env: process.env })))) {
@@ -292,91 +274,13 @@ export async function finalizeOnboardingWizard(
   let hatchChoice: "tui" | "web" | "later" | null = null;
   let launchedTui = false;
 
+  // Auto: skip hatch prompt, select "later"
   if (!opts.skipUi && gatewayProbe.ok) {
-    if (hasBootstrap) {
-      await prompter.note(
-        [
-          "This is the defining action that makes your agent you.",
-          "Please take your time.",
-          "The more you tell it, the better the experience will be.",
-          'We will send: "Wake up, my friend!"',
-        ].join("\n"),
-        "Start TUI (best option!)",
-      );
-    }
-
+    hatchChoice = "later";
     await prompter.note(
-      [
-        "Gateway token: shared auth for the Gateway + Control UI.",
-        "Stored in: ~/.openclaw/openclaw.json (gateway.auth.token) or OPENCLAW_GATEWAY_TOKEN.",
-        `View token: ${formatCliCommand("openclaw config get gateway.auth.token")}`,
-        `Generate token: ${formatCliCommand("openclaw doctor --generate-gateway-token")}`,
-        "Web UI stores a copy in this browser's localStorage (openclaw.control.settings.v1).",
-        `Open the dashboard anytime: ${formatCliCommand("openclaw dashboard --no-open")}`,
-        "If prompted: paste the token into Control UI settings (or use the tokenized dashboard URL).",
-      ].join("\n"),
-      "Token",
+      `When you're ready: ${formatCliCommand("openclaw dashboard --no-open")}`,
+      "Later",
     );
-
-    hatchChoice = await prompter.select({
-      message: "How do you want to hatch your bot?",
-      options: [
-        { value: "tui", label: "Hatch in TUI (recommended)" },
-        { value: "web", label: "Open the Web UI" },
-        { value: "later", label: "Do this later" },
-      ],
-      initialValue: "tui",
-    });
-
-    if (hatchChoice === "tui") {
-      restoreTerminalState("pre-onboarding tui");
-      await runTui({
-        url: links.wsUrl,
-        token: settings.authMode === "token" ? settings.gatewayToken : undefined,
-        password: settings.authMode === "password" ? nextConfig.gateway?.auth?.password : "",
-        // Safety: onboarding TUI should not auto-deliver to lastProvider/lastTo.
-        deliver: false,
-        message: hasBootstrap ? "Wake up, my friend!" : undefined,
-      });
-      launchedTui = true;
-    } else if (hatchChoice === "web") {
-      const browserSupport = await detectBrowserOpenSupport();
-      if (browserSupport.ok) {
-        controlUiOpened = await openUrl(authedUrl);
-        if (!controlUiOpened) {
-          controlUiOpenHint = formatControlUiSshHint({
-            port: settings.port,
-            basePath: controlUiBasePath,
-            token: settings.authMode === "token" ? settings.gatewayToken : undefined,
-          });
-        }
-      } else {
-        controlUiOpenHint = formatControlUiSshHint({
-          port: settings.port,
-          basePath: controlUiBasePath,
-          token: settings.authMode === "token" ? settings.gatewayToken : undefined,
-        });
-      }
-      await prompter.note(
-        [
-          `Dashboard link (with token): ${authedUrl}`,
-          controlUiOpened
-            ? "Opened in your browser. Keep that tab to control OpenClaw."
-            : "Copy/paste this URL in a browser on this machine to control OpenClaw.",
-          controlUiOpenHint,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        "Dashboard ready",
-      );
-    } else {
-      await prompter.note(
-        `When you're ready: ${formatCliCommand("openclaw dashboard --no-open")}`,
-        "Later",
-      );
-    }
-  } else if (opts.skipUi) {
-    await prompter.note("Skipping Control UI/TUI prompts.", "Control UI");
   }
 
   await prompter.note(

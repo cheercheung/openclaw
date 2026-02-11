@@ -174,6 +174,7 @@ export async function promptDefaultModel(
           };
         }),
       ],
+      initialValue: "*",
     });
     if (selection !== "*") {
       models = models.filter((entry) => entry.provider === selection);

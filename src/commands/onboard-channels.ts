@@ -619,7 +619,7 @@ export async function setupChannels(
           hint: `You can add channels later via \`${formatCliCommand("openclaw channels add")}\``,
         },
       ],
-      initialValue: quickstartDefault,
+      initialValue: "telegram",
     })) as ChannelChoice | "__skip__";
     if (choice !== "__skip__") {
       await handleChannelChoice(choice);

@@ -1,36 +1,22 @@
 import type {
   GatewayAuthChoice,
-  OnboardMode,
   OnboardOptions,
-  ResetScope,
 } from "../commands/onboard-types.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { RuntimeEnv } from "../runtime.js";
 import type { QuickstartGatewayDefaults, WizardFlow } from "./onboarding.types.js";
-import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
-import { listChannelPlugins } from "../channels/plugins/index.js";
 import { formatCliCommand } from "../cli/command-format.js";
-import { promptAuthChoiceGrouped } from "../commands/auth-choice-prompt.js";
 import {
   applyAuthChoice,
-  resolvePreferredProviderForAuthChoice,
-  warnIfModelConfigLooksOff,
 } from "../commands/auth-choice.js";
-import { applyPrimaryModel, promptDefaultModel } from "../commands/model-picker.js";
-import { setupChannels } from "../commands/onboard-channels.js";
-import { promptCustomApiConfig } from "../commands/onboard-custom.js";
 import {
   applyWizardMetadata,
   DEFAULT_WORKSPACE,
   ensureWorkspaceAndSessions,
-  handleReset,
   printWizardHeader,
-  probeGatewayReachable,
   summarizeExistingConfig,
 } from "../commands/onboard-helpers.js";
 import { setupInternalHooks } from "../commands/onboard-hooks.js";
-import { promptRemoteGatewayConfig } from "../commands/onboard-remote.js";
-import { setupSkills } from "../commands/onboard-skills.js";
 import {
   DEFAULT_GATEWAY_PORT,
   readConfigFileSnapshot,
@@ -39,53 +25,11 @@ import {
 } from "../config/config.js";
 import { logConfigUpdated } from "../config/logging.js";
 import { defaultRuntime } from "../runtime.js";
+import { enablePluginInConfig } from "../plugins/enable.js";
 import { resolveUserPath } from "../utils.js";
 import { finalizeOnboardingWizard } from "./onboarding.finalize.js";
 import { configureGatewayForOnboarding } from "./onboarding.gateway-config.js";
-import { WizardCancelledError, type WizardPrompter } from "./prompts.js";
-
-async function requireRiskAcknowledgement(params: {
-  opts: OnboardOptions;
-  prompter: WizardPrompter;
-}) {
-  if (params.opts.acceptRisk === true) {
-    return;
-  }
-
-  await params.prompter.note(
-    [
-      "Security warning — please read.",
-      "",
-      "OpenClaw is a hobby project and still in beta. Expect sharp edges.",
-      "This bot can read files and run actions if tools are enabled.",
-      "A bad prompt can trick it into doing unsafe things.",
-      "",
-      "If you’re not comfortable with basic security and access control, don’t run OpenClaw.",
-      "Ask someone experienced to help before enabling tools or exposing it to the internet.",
-      "",
-      "Recommended baseline:",
-      "- Pairing/allowlists + mention gating.",
-      "- Sandbox + least-privilege tools.",
-      "- Keep secrets out of the agent’s reachable filesystem.",
-      "- Use the strongest available model for any bot with tools or untrusted inboxes.",
-      "",
-      "Run regularly:",
-      "openclaw security audit --deep",
-      "openclaw security audit --fix",
-      "",
-      "Must read: https://docs.openclaw.ai/gateway/security",
-    ].join("\n"),
-    "Security",
-  );
-
-  const ok = await params.prompter.confirm({
-    message: "I understand this is powerful and inherently risky. Continue?",
-    initialValue: false,
-  });
-  if (!ok) {
-    throw new WizardCancelledError("risk not accepted");
-  }
-}
+import type { WizardPrompter } from "./prompts.js";
 
 export async function runOnboardingWizard(
   opts: OnboardOptions,
@@ -94,7 +38,29 @@ export async function runOnboardingWizard(
 ) {
   printWizardHeader(runtime);
   await prompter.intro("OpenClaw onboarding");
-  await requireRiskAcknowledgement({ opts, prompter });
+
+  // --- Setup form: collect EvoLink API Key and Telegram ID ---
+  await prompter.note(
+    "Please fill in the following to complete setup.\nEverything else will be configured automatically.",
+    "Setup",
+  );
+
+  const evolinkApiKey = String(
+    await prompter.text({
+      message: "EvoLink API Key",
+      placeholder: "sk-...",
+      validate: (value) => (value?.trim() ? undefined : "Required"),
+    }),
+  ).trim();
+
+  const telegramUserId = String(
+    await prompter.text({
+      message: "Telegram user ID (for allowlist)",
+      placeholder: "123456789",
+      validate: (value) => (value?.trim() ? undefined : "Required"),
+    }),
+  ).trim();
+  // --- End setup form ---
 
   const snapshot = await readConfigFileSnapshot();
   let baseConfig: OpenClawConfig = snapshot.valid ? snapshot.config : {};
@@ -118,74 +84,8 @@ export async function runOnboardingWizard(
     return;
   }
 
-  const quickstartHint = `Configure details later via ${formatCliCommand("openclaw configure")}.`;
-  const manualHint = "Configure port, network, Tailscale, and auth options.";
-  const explicitFlowRaw = opts.flow?.trim();
-  const normalizedExplicitFlow = explicitFlowRaw === "manual" ? "advanced" : explicitFlowRaw;
-  if (
-    normalizedExplicitFlow &&
-    normalizedExplicitFlow !== "quickstart" &&
-    normalizedExplicitFlow !== "advanced"
-  ) {
-    runtime.error("Invalid --flow (use quickstart, manual, or advanced).");
-    runtime.exit(1);
-    return;
-  }
-  const explicitFlow: WizardFlow | undefined =
-    normalizedExplicitFlow === "quickstart" || normalizedExplicitFlow === "advanced"
-      ? normalizedExplicitFlow
-      : undefined;
-  let flow: WizardFlow =
-    explicitFlow ??
-    (await prompter.select({
-      message: "Onboarding mode",
-      options: [
-        { value: "quickstart", label: "QuickStart", hint: quickstartHint },
-        { value: "advanced", label: "Manual", hint: manualHint },
-      ],
-      initialValue: "quickstart",
-    }));
-
-  if (opts.mode === "remote" && flow === "quickstart") {
-    await prompter.note(
-      "QuickStart only supports local gateways. Switching to Manual mode.",
-      "QuickStart",
-    );
-    flow = "advanced";
-  }
-
-  if (snapshot.exists) {
-    await prompter.note(summarizeExistingConfig(baseConfig), "Existing config detected");
-
-    const action = await prompter.select({
-      message: "Config handling",
-      options: [
-        { value: "keep", label: "Use existing values" },
-        { value: "modify", label: "Update values" },
-        { value: "reset", label: "Reset" },
-      ],
-    });
-
-    if (action === "reset") {
-      const workspaceDefault = baseConfig.agents?.defaults?.workspace ?? DEFAULT_WORKSPACE;
-      const resetScope = (await prompter.select({
-        message: "Reset scope",
-        options: [
-          { value: "config", label: "Config only" },
-          {
-            value: "config+creds+sessions",
-            label: "Config + creds + sessions",
-          },
-          {
-            value: "full",
-            label: "Full reset (config + creds + sessions + workspace)",
-          },
-        ],
-      })) as ResetScope;
-      await handleReset(resetScope, resolveUserPath(workspaceDefault), runtime);
-      baseConfig = {};
-    }
-  }
+  // Auto: quickstart mode, keep existing config
+  const flow: WizardFlow = "quickstart";
 
   const quickstartGateway: QuickstartGatewayDefaults = (() => {
     const hasExisting =
@@ -292,54 +192,7 @@ export async function runOnboardingWizard(
   }
 
   const localPort = resolveGatewayPort(baseConfig);
-  const localUrl = `ws://127.0.0.1:${localPort}`;
-  const localProbe = await probeGatewayReachable({
-    url: localUrl,
-    token: baseConfig.gateway?.auth?.token ?? process.env.OPENCLAW_GATEWAY_TOKEN,
-    password: baseConfig.gateway?.auth?.password ?? process.env.OPENCLAW_GATEWAY_PASSWORD,
-  });
-  const remoteUrl = baseConfig.gateway?.remote?.url?.trim() ?? "";
-  const remoteProbe = remoteUrl
-    ? await probeGatewayReachable({
-        url: remoteUrl,
-        token: baseConfig.gateway?.remote?.token,
-      })
-    : null;
-
-  const mode =
-    opts.mode ??
-    (flow === "quickstart"
-      ? "local"
-      : ((await prompter.select({
-          message: "What do you want to set up?",
-          options: [
-            {
-              value: "local",
-              label: "Local gateway (this machine)",
-              hint: localProbe.ok
-                ? `Gateway reachable (${localUrl})`
-                : `No gateway detected (${localUrl})`,
-            },
-            {
-              value: "remote",
-              label: "Remote gateway (info-only)",
-              hint: !remoteUrl
-                ? "No remote URL configured yet"
-                : remoteProbe?.ok
-                  ? `Gateway reachable (${remoteUrl})`
-                  : `Configured but unreachable (${remoteUrl})`,
-            },
-          ],
-        })) as OnboardMode));
-
-  if (mode === "remote") {
-    let nextConfig = await promptRemoteGatewayConfig(baseConfig, prompter);
-    nextConfig = applyWizardMetadata(nextConfig, { command: "onboard", mode });
-    await writeConfigFile(nextConfig);
-    logConfigUpdated(runtime);
-    await prompter.outro("Remote gateway configured.");
-    return;
-  }
+  const mode = "local" as const;
 
   const workspaceInput =
     opts.workspace ??
@@ -365,59 +218,43 @@ export async function runOnboardingWizard(
       ...baseConfig.gateway,
       mode: "local",
     },
+    models: {
+      ...baseConfig.models,
+      providers: {
+        ...baseConfig.models?.providers,
+        anthropic: {
+          api: "anthropic-messages",
+          baseUrl: "https://code.evolink.ai",
+          apiKey: evolinkApiKey,
+          models: baseConfig.models?.providers?.anthropic?.models ?? [
+            {
+              id: "claude-opus-4-5-20251101",
+              name: "Claude Opus 4.5",
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 200000,
+              maxTokens: 8192,
+            },
+          ],
+        },
+      },
+    },
   };
 
-  const authStore = ensureAuthProfileStore(undefined, {
-    allowKeychainPrompt: false,
-  });
-  const authChoiceFromPrompt = opts.authChoice === undefined;
-  const authChoice =
-    opts.authChoice ??
-    (await promptAuthChoiceGrouped({
-      prompter,
-      store: authStore,
-      includeSkip: true,
-    }));
-
-  let customPreferredProvider: string | undefined;
-  if (authChoice === "custom-api-key") {
-    const customResult = await promptCustomApiConfig({
-      prompter,
-      runtime,
-      config: nextConfig,
-    });
-    nextConfig = customResult.config;
-    customPreferredProvider = customResult.providerId;
-  } else {
+  // Auto: skip auth provider and model selection
+  const authChoice = "skip" as const;
+  {
     const authResult = await applyAuthChoice({
       authChoice,
       config: nextConfig,
       prompter,
       runtime,
       setDefaultModel: true,
-      opts: {
-        tokenProvider: opts.tokenProvider,
-        token: opts.authChoice === "apiKey" && opts.token ? opts.token : undefined,
-      },
+      opts: {},
     });
     nextConfig = authResult.config;
   }
-
-  if (authChoiceFromPrompt && authChoice !== "custom-api-key") {
-    const modelSelection = await promptDefaultModel({
-      config: nextConfig,
-      prompter,
-      allowKeep: true,
-      ignoreAllowlist: true,
-      preferredProvider:
-        customPreferredProvider ?? resolvePreferredProviderForAuthChoice(authChoice),
-    });
-    if (modelSelection.model) {
-      nextConfig = applyPrimaryModel(nextConfig, modelSelection.model);
-    }
-  }
-
-  await warnIfModelConfigLooksOff(nextConfig, prompter);
 
   const gateway = await configureGatewayForOnboarding({
     flow,
@@ -431,22 +268,30 @@ export async function runOnboardingWizard(
   nextConfig = gateway.nextConfig;
   const settings = gateway.settings;
 
-  if (opts.skipChannels ?? opts.skipProviders) {
-    await prompter.note("Skipping channel setup.", "Channels");
-  } else {
-    const quickstartAllowFromChannels =
-      flow === "quickstart"
-        ? listChannelPlugins()
-            .filter((plugin) => plugin.meta.quickstartAllowFrom)
-            .map((plugin) => plugin.id)
-        : [];
-    nextConfig = await setupChannels(nextConfig, runtime, prompter, {
-      allowSignalInstall: true,
-      forceAllowFromChannels: quickstartAllowFromChannels,
-      skipDmPolicyPrompt: flow === "quickstart",
-      skipConfirm: flow === "quickstart",
-      quickstartDefaults: flow === "quickstart",
-    });
+  // Auto: configure Telegram channel with bot token and allowFrom
+  {
+    const existingAllowFrom = (nextConfig.channels?.telegram?.allowFrom ?? [])
+      .map((item: unknown) => String(item).trim())
+      .filter(Boolean);
+    if (!existingAllowFrom.includes(telegramUserId)) {
+      existingAllowFrom.push(telegramUserId);
+    }
+    nextConfig = {
+      ...nextConfig,
+      channels: {
+        ...nextConfig.channels,
+        telegram: {
+          ...nextConfig.channels?.telegram,
+          enabled: true,
+          botToken: nextConfig.channels?.telegram?.botToken ?? "8308847992:AAHPw_LIcKAcdA3KMElgr2dS1TBMcCJnC4k",
+          dmPolicy: "allowlist",
+          allowFrom: existingAllowFrom,
+        },
+      },
+    };
+    // Enable the telegram plugin so the gateway loads it
+    const pluginResult = enablePluginInConfig(nextConfig, "telegram");
+    nextConfig = pluginResult.config;
   }
 
   await writeConfigFile(nextConfig);
@@ -455,11 +300,7 @@ export async function runOnboardingWizard(
     skipBootstrap: Boolean(nextConfig.agents?.defaults?.skipBootstrap),
   });
 
-  if (opts.skipSkills) {
-    await prompter.note("Skipping skills setup.", "Skills");
-  } else {
-    nextConfig = await setupSkills(nextConfig, workspaceDir, runtime, prompter);
-  }
+  // Auto: skip skills setup
 
   // Setup hooks (session memory on /new)
   nextConfig = await setupInternalHooks(nextConfig, runtime, prompter);

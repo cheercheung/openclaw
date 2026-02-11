@@ -75,7 +75,7 @@ export async function setupSkills(
 
   const shouldConfigure = await prompter.confirm({
     message: "Configure skills now? (recommended)",
-    initialValue: true,
+    initialValue: false,
   });
   if (!shouldConfigure) {
     return cfg;
